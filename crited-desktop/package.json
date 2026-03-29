@@ -1,0 +1,89 @@
+{
+  "name": "crited-desktop",
+  "version": "1.0.0",
+  "description": "Crited — AI Workspace for Product Teams",
+  "main": "electron/main.js",
+  "author": {
+    "name": "Zakhar Bernyk",
+    "email": "bernykzahar@gmail.com"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start":     "electron .",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:all": "electron-builder --mac --win",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "electron-updater": "^6.1.7"
+  },
+  "devDependencies": {
+    "electron":         "^29.0.0",
+    "electron-builder": "^24.9.1"
+  },
+  "build": {
+    "appId":       "com.crited.desktop",
+    "productName": "Crited",
+    "copyright":   "Copyright © 2025 Crited",
+    "directories": {
+      "output":           "dist",
+      "buildResources":   "build"
+    },
+    "files": [
+      "electron/**/*",
+      "build/icon.*",
+      "build/tray-icon.png",
+      "build/dmg-background.png",
+      "build/entitlements.mac.plist"
+    ],
+    "protocols": [
+      { "name": "Crited", "schemes": ["crited"] }
+    ],
+    "publish": {
+      "provider":     "github",
+      "owner":        "fold-ai",
+      "repo":         "crited-desktop",
+      "releaseType":  "release"
+    },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["arm64", "x64"] }
+      ],
+      "icon":                "build/icon.icns",
+      "category":            "public.app-category.productivity",
+      "darkModeSupport":     true,
+      "hardenedRuntime":     true,
+      "gatekeeperAssess":    false,
+      "entitlements":        "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "dmg": {
+      "title":      "Install Crited",
+      "icon":       "build/icon.icns",
+      "background": "build/dmg-background.png",
+      "window":     { "width": 540, "height": 380 },
+      "contents": [
+        { "x": 150, "y": 185, "type": "file" },
+        { "x": 390, "y": 185, "type": "link", "path": "/Applications" }
+      ],
+      "iconSize": 100
+    },
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon":          "build/icon.ico",
+      "publisherName": "Crited"
+    },
+    "nsis": {
+      "oneClick":                        true,
+      "perMachine":                      false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut":           true,
+      "createStartMenuShortcut":         true,
+      "shortcutName":                    "Crited"
+    }
+  }
+}
