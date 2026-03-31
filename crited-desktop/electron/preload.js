@@ -1,0 +1,11 @@
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('electronAPI', {
+  isDesktop:        true,
+  platform:         process.platform,
+  getVersion:       ()            => ipcRenderer.invoke('get-version'),
+  quitAndInstall:   ()            => ipcRenderer.invoke('quit-and-install'),
+  notify:           (title, body) => ipcRenderer.invoke('notify', { title, body }),
+  openExternal:     (url)         => ipcRenderer.invoke('open-external', url),
+  navigateTo:       (url)         => ipcRenderer.invoke('navigate-to', url),
+});
