@@ -8,13 +8,13 @@ const APP_NAME  = 'Crited';
 const APP_URL   = 'https://crited.com';
 const ICON_PATH = path.join(__dirname, '../build/icon.png');
 
-let mainWindow  = null;
-let tray        = null;
+let mainWindow   = null;
+let authWindow   = null;   // single OAuth popup
+let tray         = null;
 let splashWindow = null;
-let isQuitting  = false;
+let isQuitting   = false;
 
 // ─── DESKTOP CSS ─────────────────────────────────────────────
-// Injected on every page load + SPA navigation so drag always works
 const DESKTOP_CSS = `
   /* ── macOS traffic light safe zone ── */
   body[data-platform="darwin"] nav:first-of-type,
@@ -24,7 +24,7 @@ const DESKTOP_CSS = `
     padding-left: 84px !important;
   }
 
-  /* ── Make top bars draggable (move window by dragging) ── */
+  /* ── Make top bars draggable ── */
   body.crited-desktop nav,
   body.crited-desktop header,
   body.crited-desktop [data-tauri-drag-region],
@@ -34,7 +34,7 @@ const DESKTOP_CSS = `
     user-select: none;
   }
 
-  /* ── Buttons/inputs inside drag area must NOT be draggable ── */
+  /* ── Interactive elements — NOT draggable ── */
   body.crited-desktop nav button,
   body.crited-desktop nav a,
   body.crited-desktop nav input,
@@ -54,18 +54,21 @@ const DESKTOP_CSS = `
 
 function injectDesktopEnv() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  // Only inject on crited.com pages — skip Stripe, Google, etc.
+  const currentURL = mainWindow.webContents.getURL();
+  if (!currentURL.startsWith(APP_URL)) return;
+
   const version = app.getVersion();
   const platform = process.platform;
   mainWindow.webContents.executeJavaScript(`
     (function() {
-      // Set desktop flags
       document.body.classList.add('crited-desktop');
       document.body.setAttribute('data-platform', '${platform}');
       window.__CRITED_DESKTOP__  = true;
       window.__CRITED_VERSION__  = '${version}';
       window.__CRITED_PLATFORM__ = '${platform}';
 
-      // Inject/refresh CSS (idempotent)
       let s = document.getElementById('crited-desktop-styles');
       if (!s) {
         s = document.createElement('style');
@@ -74,13 +77,11 @@ function injectDesktopEnv() {
       }
       s.textContent = ${JSON.stringify(DESKTOP_CSS)};
 
-      // Tag topbar divs so CSS can target them for drag
-      // The right-panel topbar in AppLayout is a plain div with border-bottom
       if (!window.__critedDragObserver) {
         function tagDragRegions() {
           document.querySelectorAll('div[style*="border-bottom"]').forEach(el => {
             const style = el.getAttribute('style') || '';
-            if (style.includes('border-bottom') && style.includes('flex') && 
+            if (style.includes('border-bottom') && style.includes('flex') &&
                 el.offsetHeight < 60 && el.offsetHeight > 20 &&
                 !el.classList.contains('crited-desktop-topbar')) {
               el.classList.add('crited-desktop-topbar');
@@ -96,7 +97,6 @@ function injectDesktopEnv() {
     })();
   `).catch(() => {});
 }
-
 
 // ─── AUTO UPDATER ─────────────────────────────────────────────
 function setupAutoUpdater() {
@@ -125,77 +125,64 @@ function createSplash() {
 }
 
 // ─── OAUTH POPUP ─────────────────────────────────────────────
-// Opens a child BrowserWindow for Google/GitHub login.
-// The full OAuth flow happens inside this popup:
-//   1. Supabase /auth/v1/authorize → redirects to Google/GitHub
-//   2. User logs in on Google/GitHub
-//   3. Google/GitHub redirects back to Supabase callback
-//   4. Supabase redirects to crited.com with tokens in hash or ?code=
-// We intercept step 4 and load the final URL in the main window.
-function openOAuthPopup(url) {
-  const popup = new BrowserWindow({
-    width: 520,
-    height: 720,
-    parent: mainWindow,
-    modal: false,
-    show: false,          // show after first paint to avoid grey flash
-    title: 'Sign in to Crited',
-    backgroundColor: '#1a1a1a',
+// Single popup window for Google/GitHub login.
+// NOT a child of mainWindow so minimizing it won't minimize the app.
+// Uses same partition so cookies persist (Google remembers account).
+function openOAuthWindow(url) {
+  // Close existing auth window if any (prevents double popups)
+  if (authWindow && !authWindow.isDestroyed()) {
+    authWindow.focus();
+    authWindow.loadURL(url);
+    return;
+  }
+
+  authWindow = new BrowserWindow({
+    width: 500,
+    height: 700,
+    // NO parent — independent window, minimizing won't affect main
+    show: false,
+    title: 'Sign in — Crited',
+    backgroundColor: '#ffffff',
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      partition: 'persist:crited',  // same partition as main → cookies shared
     },
   });
 
-  popup.loadURL(url);
+  authWindow.loadURL(url);
 
-  // Show popup once the page actually loads (avoids grey flash)
-  popup.webContents.once('did-finish-load', () => {
-    if (!popup.isDestroyed()) popup.show();
+  // Show once loaded (avoid white flash)
+  authWindow.webContents.once('did-finish-load', () => {
+    if (authWindow && !authWindow.isDestroyed()) authWindow.show();
   });
-  // Fallback: show after 2s no matter what
-  setTimeout(() => { if (!popup.isDestroyed() && !popup.isVisible()) popup.show(); }, 2000);
+  setTimeout(() => {
+    if (authWindow && !authWindow.isDestroyed() && !authWindow.isVisible()) authWindow.show();
+  }, 1500);
 
-  // Check if a URL is the final OAuth redirect back to our app
-  const isFinalRedirect = (navUrl) => {
-    if (!navUrl.startsWith(APP_URL)) return false;
-    // Must have auth tokens or PKCE code — not just crited.com
-    if (navUrl.includes('access_token=')) return true;
-    if (navUrl.includes('refresh_token=')) return true;
-    try {
-      const u = new URL(navUrl);
-      if (u.searchParams.has('code')) return true;
-      // Also check hash
-      if (u.hash && u.hash.includes('access_token=')) return true;
-    } catch {}
-    return false;
+  // Watch for redirect back to crited.com with auth tokens
+  const checkRedirect = (navUrl) => {
+    if (!navUrl.startsWith(APP_URL)) return;
+    // Has tokens in hash or code in query → auth complete
+    if (navUrl.includes('access_token=') || navUrl.includes('code=') ||
+        (navUrl.includes('#') && navUrl.includes('token'))) {
+      // Load the callback URL in main window so Supabase SDK picks up session
+      mainWindow.loadURL(navUrl);
+      if (authWindow && !authWindow.isDestroyed()) authWindow.close();
+    }
   };
 
-  // When we detect the final redirect, load it in main window
-  const handleFinalRedirect = (navUrl) => {
-    if (!isFinalRedirect(navUrl)) return false;
-    mainWindow.loadURL(navUrl);
-    if (!popup.isDestroyed()) popup.close();
-    return true;
-  };
+  authWindow.webContents.on('will-navigate', (_e, navUrl) => checkRedirect(navUrl));
+  authWindow.webContents.on('did-navigate', (_e, navUrl) => checkRedirect(navUrl));
+  authWindow.webContents.on('will-redirect', (_e, navUrl) => checkRedirect(navUrl));
 
-  popup.webContents.on('will-navigate', (event, navUrl) => {
-    if (handleFinalRedirect(navUrl)) event.preventDefault();
-  });
-
-  popup.webContents.on('did-navigate', (_event, navUrl) => {
-    handleFinalRedirect(navUrl);
-  });
-
-  popup.webContents.on('will-redirect', (event, navUrl) => {
-    if (handleFinalRedirect(navUrl)) event.preventDefault();
-  });
-
-  // Some OAuth flows open sub-windows — keep them inside our popup
-  popup.webContents.setWindowOpenHandler(({ url: subUrl }) => {
-    popup.loadURL(subUrl);
+  // Keep sub-navigations inside the popup
+  authWindow.webContents.setWindowOpenHandler(({ url: subUrl }) => {
+    authWindow.loadURL(subUrl);
     return { action: 'deny' };
   });
+
+  authWindow.on('closed', () => { authWindow = null; });
 }
 
 // ─── MAIN WINDOW ──────────────────────────────────────────────
@@ -207,8 +194,9 @@ function createMainWindow() {
     minHeight: 600,
     show: false,
 
+    // FIX 4: traffic lights positioned like Cursor
     titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 20, y: 16 },
+    trafficLightPosition: { x: 14, y: 12 },
     movable: true,
 
     backgroundColor: '#0a0a0a',
@@ -218,16 +206,15 @@ function createMainWindow() {
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.js'),
       spellcheck: true,
+      partition: 'persist:crited',
     },
   });
 
   mainWindow.loadURL(APP_URL);
 
-  // Inject desktop env on every full page load
   mainWindow.webContents.on('did-finish-load', () => {
     injectDesktopEnv();
 
-    // Close splash → show main window
     if (splashWindow && !splashWindow.isDestroyed()) {
       setTimeout(() => {
         splashWindow.close();
@@ -240,35 +227,18 @@ function createMainWindow() {
     }
   });
 
-  // FIX 1: Re-inject on SPA navigation (React Router pushState)
+  // Re-inject on SPA navigation
   mainWindow.webContents.on('did-navigate-in-page', () => {
     injectDesktopEnv();
   });
 
-  // FIX 2: Intercept OAuth → open popup window instead of external browser
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    const isOAuth = (
-      url.includes('accounts.google.com') ||
-      url.includes('github.com/login/oauth') ||
-      url.includes('github.com/login?') ||
-      (url.includes('supabase.co') && url.includes('/auth/v1/authorize'))
-    );
-    if (isOAuth) {
-      event.preventDefault();
-      openOAuthPopup(url);
-    }
+  // Re-inject after full navigation (OAuth redirect back)
+  mainWindow.webContents.on('did-navigate', () => {
+    injectDesktopEnv();
   });
 
+  // External links via window.open → system browser
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    const isOAuth = (
-      url.includes('accounts.google.com') ||
-      url.includes('github.com/login') ||
-      url.includes('supabase.co/auth')
-    );
-    if (isOAuth) {
-      openOAuthPopup(url);
-      return { action: 'deny' };
-    }
     if (url.startsWith(APP_URL)) return { action: 'allow' };
     shell.openExternal(url);
     return { action: 'deny' };
@@ -285,7 +255,7 @@ function createMainWindow() {
   return mainWindow;
 }
 
-// ─── DEEP LINK — auth callback ────────────────────────────────
+// ─── DEEP LINK ────────────────────────────────────────────────
 function setupDeepLink() {
   if (process.defaultApp && process.argv.length >= 2) {
     app.setAsDefaultProtocolClient('crited', process.execPath, [path.resolve(process.argv[1])]);
@@ -350,12 +320,21 @@ function showAndNavigate(p) {
 
 // ─── IPC ──────────────────────────────────────────────────────
 function setupIPC() {
-  ipcMain.handle('get-version',        ()          => app.getVersion());
-  ipcMain.handle('quit-and-install',   ()          => { isQuitting = true; autoUpdater.quitAndInstall(); });
-  ipcMain.handle('open-external',      (_, url)    => shell.openExternal(url));
-  ipcMain.handle('open-auth-popup',    (_, url)    => openOAuthPopup(url));
+  ipcMain.handle('get-version',      ()          => app.getVersion());
+  ipcMain.handle('quit-and-install', ()          => { isQuitting = true; autoUpdater.quitAndInstall(); });
+  ipcMain.handle('open-external',    (_, url)    => shell.openExternal(url));
   ipcMain.handle('notify', (_, { title, body }) => {
     if (Notification.isSupported()) new Notification({ title, body, icon: ICON_PATH }).show();
+  });
+
+  // FIX 2: Open OAuth in a dedicated popup window
+  ipcMain.handle('open-auth-window', (_, url) => {
+    openOAuthWindow(url);
+  });
+
+  // FIX 5: Open external URLs (Stripe checkout) in system browser
+  ipcMain.handle('open-in-browser', (_, url) => {
+    shell.openExternal(url);
   });
 }
 
@@ -375,7 +354,8 @@ if (!app.requestSingleInstanceLock()) {
 app.whenReady().then(() => {
   setupDeepLink();
 
-  session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
+  const ses = session.fromPartition('persist:crited');
+  ses.webRequest.onBeforeSendHeaders((details, callback) => {
     callback({ requestHeaders: {
       ...details.requestHeaders,
       'User-Agent': `Crited Desktop/${app.getVersion()} Electron/${process.versions.electron}`,
